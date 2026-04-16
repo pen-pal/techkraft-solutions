@@ -1,0 +1,255 @@
+# =============================================================================
+# Kubernetes Manifests for TechKraft Flask API
+# Includes: Deployment, Service, HPA, ConfigMap, PDB
+# =============================================================================
+
+---
+# ConfigMap — application configuration (non-sensitive)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: techkraft-api-config
+  namespace: techkraft
+  labels:
+    app: techkraft-api
+    managed-by: kubectl
+data:
+  APP_ENV: "production"
+  APP_LOG_LEVEL: "INFO"
+  DB_HOST: "techkraft-db.cluster-xxxx.us-east-1.rds.amazonaws.com"
+  DB_PORT: "3306"
+  DB_NAME: "techkraft"
+  WORKERS: "4"
+  BIND_ADDRESS: "0.0.0.0:5000"
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: techkraft-api
+  namespace: techkraft
+  labels:
+    app: techkraft-api
+    version: v1
+spec:
+  replicas: 2                         # Minimum 2 as required
+  revisionHistoryLimit: 5             # Keep 5 old ReplicaSets for rollback
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0               # Zero-downtime: never kill a pod before a new one is ready
+      maxSurge: 1                     # Roll one pod at a time
+  selector:
+    matchLabels:
+      app: techkraft-api
+  template:
+    metadata:
+      labels:
+        app: techkraft-api
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/health"
+    spec:
+      # Security context at the pod level
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      # Spread pods across nodes and AZs for high availability
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: techkraft-api
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: techkraft-api
+
+      # Graceful shutdown
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: techkraft-api
+          image: ghcr.io/techkraft/techkraft-api:1.0.0    # Always use a specific tag, never :latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+
+          # Environment variables from ConfigMap
+          envFrom:
+            - configMapRef:
+                name: techkraft-api-config
+
+          # Sensitive values from Secrets (DB password, API keys)
+          env:
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: techkraft-db-credentials
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: techkraft-db-credentials
+                  key: password
+
+          # Resource limits & requests
+          resources:
+            requests:
+              cpu: 250m               # 0.25 vCPU guaranteed
+              memory: 256Mi           # 256 MB guaranteed
+            limits:
+              cpu: 500m               # 0.5 vCPU maximum
+              memory: 512Mi           # 512 MB maximum — OOMKill above this
+
+          # Liveness probe: Is the container alive?
+          # If this fails 3 times, Kubernetes restarts the container.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15    # Wait for gunicorn to start
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          # Readiness probe: Is the container ready to receive traffic?
+          # If this fails, the pod is removed from the Service endpoints
+          # (stops receiving traffic) but is NOT restarted.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+
+          # Startup probe: Handles slow-starting containers
+          # Gives the app up to 30 × 5s = 150s to start
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+
+          # Container security context
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+          # Writable tmp directory for gunicorn worker temp files
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+
+---
+# Service — ClusterIP (exposed via Ingress or ALB controller)
+apiVersion: v1
+kind: Service
+metadata:
+  name: techkraft-api
+  namespace: techkraft
+  labels:
+    app: techkraft-api
+  annotations:
+    # If using AWS ALB Ingress Controller:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+spec:
+  type: ClusterIP
+  selector:
+    app: techkraft-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+
+---
+# HorizontalPodAutoscaler — scale between 2 and 10 replicas
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: techkraft-api
+  namespace: techkraft
+  labels:
+    app: techkraft-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: techkraft-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    # Scale on CPU utilisation
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70      # Scale up when avg CPU > 70%
+
+    # Scale on memory utilisation
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  behavior:
+    # Scale up aggressively, scale down conservatively
+    scaleUp:
+      stabilizationWindowSeconds: 60  # Wait 1 min before scaling up again
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60           # Add up to 2 pods per minute
+    scaleDown:
+      stabilizationWindowSeconds: 300 # Wait 5 min before scaling down
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120          # Remove at most 1 pod every 2 minutes
+
+---
+# PodDisruptionBudget — ensure at least 1 pod is always available
+# during voluntary disruptions (node drain, cluster upgrade, etc.)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: techkraft-api
+  namespace: techkraft
+  labels:
+    app: techkraft-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: techkraft-api
